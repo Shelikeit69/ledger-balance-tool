@@ -1,7 +1,8 @@
 ﻿.venv/
 dist/
 build/
-*.spec
+# PyInstaller build artefacts (but not the spec source file)
+!ledger.spec
 __pycache__/
 *.pyc
 *.pyo
