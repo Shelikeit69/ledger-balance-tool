@@ -8,13 +8,7 @@ pip install pyinstaller
 if (Test-Path "dist") { Remove-Item -Recurse -Force "dist" }
 if (Test-Path "build") { Remove-Item -Recurse -Force "build" }
 
-# 打包
-pyinstaller `
-    --onefile `
-    --windowed `
-    --name "账目配平工具" `
-    --add-data "src;src" `
-    --paths "src" `
-    src\ledger\ui\main_window.py
+# 打包（使用 spec 文件以确保依赖完整）
+pyinstaller ledger.spec
 
 Write-Host "构建完成，输出在 dist\ 目录"
