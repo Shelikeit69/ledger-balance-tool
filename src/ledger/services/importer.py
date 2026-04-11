@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import csv
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -11,10 +11,9 @@ from openpyxl import load_workbook
 from ledger.config import REQUIRED_LEDGER_COLUMNS, TARGET_SHEET_NAME
 
 
-# ── 标准化数据结构 ─────────────────────────────────────
-
 @dataclass(frozen=True)
-class NormalizedLedgerRow:
+class ImportedLedgerRow:
+    row_index: int
     subject_code: str
     subject_name: str
     posted_date: date | None
@@ -25,9 +24,11 @@ class NormalizedLedgerRow:
     credit_amount: Decimal
     direction: str
     balance: Decimal
+    row_type: str
+    amount_side: str
+    original_amount: Decimal
+    remaining_amount: Decimal
 
-
-# ── 导入结果 ───────────────────────────────────────────
 
 @dataclass(frozen=True)
 class FileImportError:
@@ -38,7 +39,7 @@ class FileImportError:
 
 @dataclass
 class ImportResult:
-    rows: list[NormalizedLedgerRow]
+    rows: list[ImportedLedgerRow]
     file_errors: list[FileImportError]
 
     def __init__(self) -> None:
@@ -50,8 +51,6 @@ class ImportResult:
         return len(self.rows)
 
 
-# ── 公开接口 ───────────────────────────────────────────
-
 def import_paths(paths: list[Path]) -> ImportResult:
     result = ImportResult()
     for path in [Path(p) for p in paths]:
@@ -62,8 +61,6 @@ def import_paths(paths: list[Path]) -> ImportResult:
             _import_supported_path(path, result)
     return result
 
-
-# ── 内部实现 ───────────────────────────────────────────
 
 def _import_supported_path(file_path: Path, result: ImportResult) -> None:
     suffix = file_path.suffix.lower()
@@ -77,11 +74,13 @@ def _import_xlsx(file_path: Path, result: ImportResult) -> None:
     workbook = load_workbook(file_path, read_only=True, data_only=True)
     try:
         if TARGET_SHEET_NAME not in workbook.sheetnames:
-            result.file_errors.append(FileImportError(
-                file_path=file_path,
-                code="missing_sheet",
-                message=f"找不到工作表「{TARGET_SHEET_NAME}」",
-            ))
+            result.file_errors.append(
+                FileImportError(
+                    file_path=file_path,
+                    code="missing_sheet",
+                    message=f"找不到工作表「{TARGET_SHEET_NAME}」",
+                )
+            )
             return
 
         sheet = workbook[TARGET_SHEET_NAME]
@@ -92,17 +91,20 @@ def _import_xlsx(file_path: Path, result: ImportResult) -> None:
         headers = [str(v).strip() if v is not None else "" for v in rows[0]]
         missing = [c for c in REQUIRED_LEDGER_COLUMNS if c not in headers]
         if missing:
-            result.file_errors.append(FileImportError(
-                file_path=file_path,
-                code="missing_columns",
-                message=f"缺少列：{', '.join(missing)}",
-            ))
+            result.file_errors.append(
+                FileImportError(
+                    file_path=file_path,
+                    code="missing_columns",
+                    message=f"缺少列：{', '.join(missing)}",
+                )
+            )
             return
 
-        for values in rows[1:]:
+        state = _CarryForwardState()
+        for row_index, values in enumerate(rows[1:], start=1):
             raw = dict(zip(headers, values, strict=False))
-            if not _is_summary_row(raw):
-                result.rows.append(_normalize(raw))
+            normalized = _normalize(raw, row_index=row_index, carry_state=state)
+            result.rows.append(normalized)
     finally:
         workbook.close()
 
@@ -113,60 +115,114 @@ def _import_csv(file_path: Path, result: ImportResult) -> None:
         headers = reader.fieldnames or []
         missing = [c for c in REQUIRED_LEDGER_COLUMNS if c not in headers]
         if missing:
-            result.file_errors.append(FileImportError(
-                file_path=file_path,
-                code="missing_columns",
-                message=f"缺少列：{', '.join(missing)}",
-            ))
+            result.file_errors.append(
+                FileImportError(
+                    file_path=file_path,
+                    code="missing_columns",
+                    message=f"缺少列：{', '.join(missing)}",
+                )
+            )
             return
-        for raw in reader:
-            row_dict = dict(raw)
-            if not _is_summary_row(row_dict):
-                result.rows.append(_normalize(row_dict))
+
+        state = _CarryForwardState()
+        for row_index, raw in enumerate(reader, start=1):
+            result.rows.append(_normalize(dict(raw), row_index=row_index, carry_state=state))
 
 
-# ── 汇总行过滤 ─────────────────────────────────────────
-
-_SUMMARY_ROW_KEYWORDS = frozenset({
-    "本期合计",
-    "期初余额",
-    "本期发生额",
-    "本年累计",
-    "期末余额",
-    "合计",
-})
+class _CarryForwardState:
+    def __init__(self) -> None:
+        self.subject_code = ""
+        self.subject_name = ""
 
 
-def _is_summary_row(raw: dict[str, object]) -> bool:
-    summary = str(raw.get("摘要", "")).replace(" ", "").replace("\u3000", "")
-    return summary in _SUMMARY_ROW_KEYWORDS
+_OPENING_KEYWORDS = ("年初余额", "期初余额")
+_PERIOD_TOTAL_KEYWORDS = ("本期合计", "本期发生额", "合计")
+_YEAR_TOTAL_KEYWORDS = ("本年累计",)
 
 
-# ── 标准化单行 ─────────────────────────────────────────
+def _normalize(
+    raw: dict[str, object],
+    *,
+    row_index: int,
+    carry_state: _CarryForwardState,
+) -> ImportedLedgerRow:
+    subject_code = _carry_forward_text(raw.get("科目代码"), carry_state.subject_code)
+    subject_name = _carry_forward_text(raw.get("科目名称"), carry_state.subject_name)
+    carry_state.subject_code = subject_code or carry_state.subject_code
+    carry_state.subject_name = subject_name or carry_state.subject_name
 
-def _normalize(raw: dict[str, object]) -> NormalizedLedgerRow:
-    voucher_no = str(raw.get("凭证字号", "")).replace(" ", "")
-    return NormalizedLedgerRow(
-        subject_code=str(raw.get("科目代码", "")).strip(),
-        subject_name=str(raw.get("科目名称", "")).strip(),
+    summary = str(raw.get("摘要", "")).strip()
+    debit_amount = _parse_decimal(raw.get("借方金额"))
+    credit_amount = _parse_decimal(raw.get("贷方金额"))
+    row_type = _detect_row_type(summary)
+    amount_side = _detect_amount_side(debit_amount, credit_amount)
+    original_amount = _calculate_original_amount(row_type, debit_amount, credit_amount)
+    remaining_amount = original_amount if row_type == "entry" else Decimal("0.00")
+
+    return ImportedLedgerRow(
+        row_index=row_index,
+        subject_code=subject_code,
+        subject_name=subject_name,
         posted_date=_parse_date(raw.get("日期")),
         business_date=_parse_date(raw.get("业务日期")),
-        voucher_no=voucher_no,
-        summary=str(raw.get("摘要", "")).strip(),
-        debit_amount=_parse_decimal(raw.get("借方金额")),
-        credit_amount=_parse_decimal(raw.get("贷方金额")),
+        voucher_no=str(raw.get("凭证字号", "")).replace(" ", ""),
+        summary=summary,
+        debit_amount=debit_amount,
+        credit_amount=credit_amount,
         direction=str(raw.get("方向", "")).strip(),
         balance=_parse_decimal(raw.get("余额")),
+        row_type=row_type,
+        amount_side=amount_side,
+        original_amount=original_amount,
+        remaining_amount=remaining_amount,
     )
+
+
+def _carry_forward_text(value: object, previous: str) -> str:
+    text = str(value).strip() if value is not None else ""
+    return text or previous
+
+
+def _detect_row_type(summary: str) -> str:
+    normalized = summary.replace(" ", "").replace("\u3000", "")
+    if any(keyword in normalized for keyword in _OPENING_KEYWORDS):
+        return "opening"
+    if any(keyword in normalized for keyword in _YEAR_TOTAL_KEYWORDS):
+        return "year_total"
+    if any(keyword in normalized for keyword in _PERIOD_TOTAL_KEYWORDS):
+        return "period_total"
+    return "entry"
+
+
+def _detect_amount_side(debit_amount: Decimal, credit_amount: Decimal) -> str:
+    if debit_amount > 0:
+        return "debit"
+    if credit_amount > 0:
+        return "credit"
+    return ""
+
+
+def _calculate_original_amount(
+    row_type: str,
+    debit_amount: Decimal,
+    credit_amount: Decimal,
+) -> Decimal:
+    if row_type != "entry":
+        return Decimal("0.00")
+    if debit_amount > 0:
+        return debit_amount
+    if credit_amount > 0:
+        return credit_amount
+    return Decimal("0.00")
 
 
 def _parse_date(value: object) -> date | None:
     if value is None:
         return None
-    if isinstance(value, date):
-        return value
     if isinstance(value, datetime):
         return value.date()
+    if isinstance(value, date):
+        return value
     text = str(value).strip()
     if not text:
         return None
@@ -175,10 +231,9 @@ def _parse_date(value: object) -> date | None:
             return datetime.strptime(text, fmt).date()
         except ValueError:
             continue
-    # Excel 序列号
     try:
         serial = int(float(text))
-        return date(1899, 12, 30) + __import__("datetime").timedelta(days=serial)
+        return date(1899, 12, 30) + timedelta(days=serial)
     except (ValueError, OverflowError):
         return None
 
@@ -186,6 +241,8 @@ def _parse_date(value: object) -> date | None:
 def _parse_decimal(value: object) -> Decimal:
     if value is None:
         return Decimal("0.00")
+    if isinstance(value, Decimal):
+        return value
     if isinstance(value, (int, float)):
         return Decimal(str(round(value, 2)))
     text = str(value).strip().replace(",", "")

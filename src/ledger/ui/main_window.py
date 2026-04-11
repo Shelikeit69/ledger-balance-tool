@@ -17,14 +17,12 @@ from ledger.config import AppConfig
 from ledger.storage.repository import LedgerRepository
 from ledger.ui.import_page import ImportPage
 from ledger.ui.results_page import ResultsPage
-from ledger.ui.rules_page import RulesPage
 from ledger.ui.settings_page import SettingsPage
 
 NAV_ITEMS = [
     ("导入", 0),
     ("结果", 1),
-    ("规则", 2),
-    ("设置", 3),
+    ("设置", 2),
 ]
 
 NAV_STYLE = """
@@ -88,12 +86,10 @@ class MainWindow(QMainWindow):
 
         self.import_page = ImportPage(self.repo, self)
         self.results_page = ResultsPage(self.repo, self)
-        self.rules_page = RulesPage(self.repo, self)
         self.settings_page = SettingsPage(self.repo, self)
 
         self.stack.addWidget(self.import_page)
         self.stack.addWidget(self.results_page)
-        self.stack.addWidget(self.rules_page)
         self.stack.addWidget(self.settings_page)
 
         layout.addWidget(self.nav)
@@ -106,8 +102,6 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentIndex(index)
         if index == 1:
             self.results_page.refresh_results()
-        elif index == 2:
-            self.rules_page.refresh_rules()
 
     def navigate_to_results(self) -> None:
         self.nav.setCurrentRow(1)
